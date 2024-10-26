@@ -3,7 +3,6 @@ import scipy
 import numpy as np
 import pandas as pd
 import logging
-logging.basicConfig(level=logging.INFO)
 from sklearn.cluster import KMeans
 from sklearn.neighbors import NearestNeighbors
 from sklearn.decomposition import PCA
@@ -11,6 +10,10 @@ import multiprocessing as mp
 from functools import partial
 from tqdm import tqdm
 from sketchKH import *
+
+
+
+
 
 def delve_fs(adata = None,
             k: int = 10,
@@ -464,3 +467,23 @@ def _annotate_clusters(mapping_df = None,
     modules[~np.isin(modules.index, dyn_feats)] = 'static'
     modules['cluster_permutation_pval'] = pval_df.median(1) #median across all random trials
     return modules
+
+
+def main():
+    adata = anndata.read_h5ad('/Users/cyrilvanleer/Desktop/Stat_ML/Project/adata_RPE.h5ad')
+
+    delta_mean, modules, ranked_features = delve_fs(adata = adata, k = 10, num_subsamples = 1000, n_clusters = 5, random_state = 0, n_jobs = -1)
+
+    print(ranked_features)
+
+
+
+
+
+
+
+
+
+if __name__ == '__main__':
+    mp.freeze_support()  # Only needed if you are going to freeze your application
+    main()
