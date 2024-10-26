@@ -848,47 +848,69 @@ def main():
     features_monocle = find_selected_features(W_monocle, X, feature_names)
     features_slingshot = find_selected_features(W_slingshot, X, feature_names)
 
-    # Create main comparison plot
-    fig = plt.figure(figsize=(15, 10))
-    gs = GridSpec(2, 3, figure=fig)
+    # Set style for better visualization
+    plt.style.use('default')
+    
+    # Create main comparison plot with enhanced spacing
+    fig = plt.figure(figsize=(20, 12))
+    gs = GridSpec(2, 3, figure=fig, height_ratios=[1, 1], width_ratios=[1.5, 1.5, 1])
+    
+    # Enhanced color palette for methods
+    method_colors = {
+        'kNN': '#FF6B6B',  # Coral Red
+        'k-means': '#4ECDC4',  # Turquoise
+        'Monocle3': '#45B7D1',  # Sky Blue
+        'Slingshot': '#96CEB4'  # Sage Green
+    }
 
     # 1. UMAP visualization with affinity graphs
     ax_umap = fig.add_subplot(gs[0, :])
     embedder = UMAP(n_components=2, random_state=0)
     X_umap = embedder.fit_transform(X_reduced)
     
-    # Plot base UMAP
+    # Plot base UMAP with enhanced scatter
     scatter = ax_umap.scatter(X_umap[:, 0], X_umap[:, 1], 
                             c=np.arange(X_umap.shape[0]), 
                             cmap='viridis', 
-                            s=1, alpha=0.6)
-    ax_umap.set_title('UMAP Visualization with Different Affinity Graphs')
+                            s=2, alpha=0.7)
+    ax_umap.set_title('UMAP Visualization with Different Affinity Graphs', 
+                     fontsize=14, pad=20)
     
-    # Add affinity connections (subsample for visibility)
+    # Add affinity connections with enhanced visibility
     methods = {
-        'kNN': (W_knn, 'red'),
-        'k-means': (W_kmeans, 'blue'),
-        'Monocle3': (W_monocle, 'green'),
-        'Slingshot': (W_slingshot, 'purple')
+        'kNN': W_knn,
+        'k-means': W_kmeans,
+        'Monocle3': W_monocle,
+        'Slingshot': W_slingshot
     }
     
-    for method_name, (W, color) in methods.items():
+    for method_name, W in methods.items():
         rows, cols = W.nonzero()
-        mask = np.random.choice(len(rows), size=min(500, len(rows)), replace=False)
+        # Intelligent subsampling based on matrix density
+        n_samples = min(300, len(rows))
+        mask = np.random.choice(len(rows), size=n_samples, replace=False)
+        
         for i, j in zip(rows[mask], cols[mask]):
             ax_umap.plot([X_umap[i, 0], X_umap[j, 0]], 
                         [X_umap[i, 1], X_umap[j, 1]], 
-                        c=color, linewidth=0.2, alpha=0.3, label=method_name)
+                        c=method_colors[method_name], 
+                        linewidth=0.3, 
+                        alpha=0.4, 
+                        label=method_name)
     
-    # Add legend (only once per method)
-    handles = [plt.Line2D([0], [0], color=color, label=method) 
-              for method, (_, color) in methods.items()]
-    ax_umap.legend(handles=handles, loc='center left', bbox_to_anchor=(1, 0.5))
+    # Enhanced legend
+    handles = [plt.Line2D([0], [0], color=color, label=method, linewidth=2) 
+              for method, color in method_colors.items()]
+    leg = ax_umap.legend(handles=handles, 
+                        loc='center left', 
+                        bbox_to_anchor=(1.02, 0.5),
+                        frameon=True,
+                        fontsize=10)
+    leg.get_frame().set_alpha(0.9)
 
-    # 2. Feature ranking correlation heatmap
+    # 2. Feature ranking correlation heatmap with enhanced readability
     ax_corr = fig.add_subplot(gs[1, :2])
     
-    # Create correlation matrix
     all_features = pd.concat([
         features_knn['DELVE'],
         features_kmeans['DELVE'],
@@ -898,16 +920,23 @@ def main():
     all_features.columns = ['kNN', 'k-means', 'Monocle3', 'Slingshot']
     corr_matrix = all_features.corr()
     
-    # Plot correlation heatmap
+    # Enhanced heatmap
     sns.heatmap(corr_matrix, 
                 annot=True, 
-                cmap='coolwarm', 
+                cmap='RdYlBu_r', 
                 vmin=-1, 
                 vmax=1, 
-                ax=ax_corr)
-    ax_corr.set_title('Feature Ranking Correlation Between Methods')
+                ax=ax_corr,
+                annot_kws={'size': 10},
+                square=True,
+                fmt='.2f')
+    
+    ax_corr.set_title('Feature Ranking Correlation Between Methods', 
+                      fontsize=14, pad=20)
+    ax_corr.set_xticklabels(ax_corr.get_xticklabels(), rotation=45, ha='right')
+    ax_corr.set_yticklabels(ax_corr.get_yticklabels(), rotation=0)
 
-    # 3. Top features comparison
+    # 3. Top features comparison with enhanced table
     ax_top = fig.add_subplot(gs[1, 2])
     
     # Get top 10 features from each method
@@ -918,32 +947,38 @@ def main():
         'Slingshot': features_slingshot['DELVE'].nlargest(10).index
     })
     
-    # Plot as table
+    # Enhanced table
     ax_top.axis('tight')
     ax_top.axis('off')
     table = ax_top.table(cellText=top_features.values,
                         colLabels=top_features.columns,
                         loc='center',
                         cellLoc='center')
+    
+    # Enhance table appearance
     table.auto_set_font_size(False)
-    table.set_fontsize(8)
-    table.scale(1.2, 1.5)
-    ax_top.set_title('Top 10 Features by Method')
+    table.set_fontsize(9)
+    table.scale(1.2, 1.8)
+    
+    # Style the header
+    for (row, col), cell in table.get_celld().items():
+        if row == 0:
+            cell.set_text_props(weight='bold')
+            cell.set_facecolor('#E6E6E6')
+        cell.set_edgecolor('#FFFFFF')
+    
+    ax_top.set_title('Top 10 Features by Method', 
+                     fontsize=14, pad=20)
 
+    # Adjust layout
     plt.tight_layout()
+    
+    # Save high-resolution figure
+    plt.savefig('affinity_comparison.png', dpi=300, bbox_inches='tight')
     plt.show()
 
 if __name__ == '__main__':
     mp.freeze_support()
     main()
-
-
-    
-
-if __name__ == '__main__':
-    mp.freeze_support()  # Only needed if you are going to freeze your application
-    main()
-
-
 
 
