@@ -10,6 +10,7 @@ import multiprocessing as mp
 from functools import partial
 from tqdm import tqdm
 from sketchKH import *
+import matplotlib.pyplot as plt
 
 
 
@@ -468,6 +469,31 @@ def _annotate_clusters(mapping_df = None,
     modules['cluster_permutation_pval'] = pval_df.median(1) #median across all random trials
     return modules
 
+def plot_attention_distribution(attention_scores, feature_names):
+    plt.figure(figsize=(12, 6))
+    
+    # Sort attention scores for better visualization
+    sorted_idx = np.argsort(attention_scores)
+    sorted_scores = attention_scores[sorted_idx]
+    sorted_features = feature_names[sorted_idx]
+    
+    # Plot distribution
+    plt.plot(range(len(sorted_scores)), sorted_scores, 'b-', label='Attention Weights')
+    plt.fill_between(range(len(sorted_scores)), sorted_scores, alpha=0.3)
+    
+    # Add top N feature labels
+    top_n = 10
+    for i in range(top_n):
+        idx = -(i+1)
+        plt.annotate(sorted_features[idx], 
+                    xy=(len(sorted_scores)+idx, sorted_scores[idx]),
+                    xytext=(5, 0), textcoords='offset points')
+    
+    plt.xlabel('Features (sorted by attention weight)')
+    plt.ylabel('Attention Weight')
+    plt.title('Distribution of Attention Weights Across Features')
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
 
 def main():
     adata = anndata.read_h5ad('/Users/cyrilvanleer/Desktop/Stat_ML/Project/adata_RPE.h5ad')

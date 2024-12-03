@@ -17,6 +17,14 @@ import matplotlib.pyplot as plt
 from umap import UMAP
 from scipy.sparse.csgraph import minimum_spanning_tree
 from matplotlib.gridspec import GridSpec 
+import scanpy as sc  # for PAGA
+import networkx as nx
+from scipy.stats import spearmanr
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch_geometric.nn import GATConv
+from torch_geometric.data import Data
 
 #### DELVE FUNCTIONS ####
 
@@ -259,7 +267,7 @@ def delta_exp(X = None,
 
 def laplacian_score(X = None,
                     W = None):
-    """Computes the Laplacian score: https://papers.nips.cc/paper/2005/file/b5b03f06271f8917685d14cea7c6c50a-Paper.pdf
+    """Computes the Laplacian score
     Parameters
     X: np.ndarray (default = None)
         array containing normalized and preprocessed data (dimensions = cells x features)
@@ -273,30 +281,34 @@ def laplacian_score(X = None,
     """
     n_samples, n_features = X.shape
     
-    #compute degree matrix
+    # Ensure W has correct dimensions
+    if W.shape[0] != n_samples or W.shape[1] != n_samples:
+        raise ValueError(f"Affinity matrix W has shape {W.shape} but expected ({n_samples}, {n_samples})")
+    
+    # Compute degree matrix
     D = np.array(W.sum(axis = 1))
     D = scipy.sparse.diags(np.transpose(D), [0])
+    
+    # Convert D to dense if it's sparse
+    D_array = D.toarray()
+    
+    # Compute graph laplacian
+    L = D_array - W.toarray() if scipy.sparse.issparse(W) else D_array - W
 
-    #compute graph laplacian
-    L = D - W.toarray()
+    # Ones vector: 1 = [1,···,1]'
+    ones = np.ones((n_samples, 1))  # Changed to column vector
 
-    #ones vector: 1 = [1,···,1]'
-    ones = np.ones((n_samples,n_features))
-
-    #feature vector: fr = [fr1,...,frm]'
+    # Feature vector: fr = [fr1,...,frm]'
     fr = X.copy()
 
-    #construct fr_t = fr - (fr' D 1/ 1' D 1) 1
-    numerator = np.matmul(np.matmul(np.transpose(fr), D.toarray()), ones)
-    denomerator = np.matmul(np.matmul(np.transpose(ones), D.toarray()), ones)
-    ratio = numerator / denomerator
-    ratio = ratio[:, 0]
-    ratio = np.tile(ratio, (n_samples, 1))
-    fr_t = fr - ratio
+    # Construct fr_t = fr - (fr' D 1/ 1' D 1) 1
+    numerator = np.matmul(np.matmul(np.transpose(fr), D_array), ones)
+    denominator = np.matmul(np.matmul(np.transpose(ones), D_array), ones)
+    ratio = numerator / denominator
+    fr_t = fr - np.matmul(ones, np.transpose(ratio))
 
-    #compute laplacian score Lr = fr_t' L fr_t / fr_t' D fr_t
-    l_score = np.matmul(np.matmul(np.transpose(fr_t), L), fr_t) / np.matmul(np.dot(np.transpose(fr_t), D.toarray()), fr_t)
-    l_score = np.diag(l_score)
+    # Compute laplacian score Lr = fr_t' L fr_t / fr_t' D fr_t
+    l_score = np.sum(fr_t * (np.matmul(L, fr_t)), axis=0) / np.sum(fr_t * (np.matmul(D_array, fr_t)), axis=0)
 
     return l_score
 
@@ -550,7 +562,7 @@ def rest_of_step2(adata):
     k = 10
     n_pcs = None
     n_jobs = -1
-    X, X_reduced, feature_names = extract_affinity(adata = adata, k = 10, num_subsamples = 1000, n_clusters = 5, random_state = 0, n_jobs = -1)
+    X, X_reduced, feature_names = extract_affinity(adata=adata, k=10, num_subsamples=1000, n_clusters=5, random_state=0, n_jobs=-1)
 
     W = construct_affinity(X = X_reduced, k = k, n_pcs = n_pcs, n_jobs = n_jobs) #constructs graph using dynamic seed features
     print(W)
@@ -749,6 +761,55 @@ def construct_affinity_slingshot(X, n_clusters=10, radius=3):
     W = csr_matrix((data, (rows, cols)), shape=(n_samples, n_samples))
     return W
 
+def construct_affinity_paga(X, n_neighbors=15):
+    """
+    Constructs affinity graph using PAGA approach.
+    """
+    # Create anndata object
+    adata = sc.AnnData(X)
+    
+    # Compute neighborhood graph
+    sc.pp.neighbors(adata, n_neighbors=n_neighbors)
+    
+    # Run Leiden clustering
+    sc.tl.leiden(adata)
+    
+    # Run PAGA
+    sc.tl.paga(adata, groups='leiden')
+    
+    # Get cluster-level connectivity matrix
+    cluster_connectivity = adata.uns['paga']['connectivities']
+    
+    # Get cell cluster assignments
+    cell_clusters = pd.Categorical(adata.obs['leiden']).codes
+    
+    # Create cell-level connectivity matrix
+    n_cells = X.shape[0]
+    rows, cols, data = [], [], []
+    
+    # For each pair of connected clusters
+    cluster_pairs = np.array(cluster_connectivity.nonzero()).T
+    for c1, c2 in cluster_pairs:
+        # Get cells in each cluster
+        cells_c1 = np.where(cell_clusters == c1)[0]
+        cells_c2 = np.where(cell_clusters == c2)[0]
+        
+        # Connection strength between clusters
+        strength = cluster_connectivity[c1, c2]
+        
+        # Connect all cells between clusters
+        for cell1 in cells_c1:
+            for cell2 in cells_c2:
+                if cell1 != cell2:  # Avoid self-loops
+                    rows.extend([cell1, cell2])
+                    cols.extend([cell2, cell1])
+                    data.extend([strength, strength])
+    
+    # Create sparse matrix
+    W = csr_matrix((data, (rows, cols)), shape=(n_cells, n_cells))
+    
+    return W
+
 def compare_affinity_methods(X, feature_names, k=10, n_clusters=10, radius=3, n_pcs=50):
     """
     Compare different affinity graph construction methods.
@@ -758,115 +819,35 @@ def compare_affinity_methods(X, feature_names, k=10, n_clusters=10, radius=3, n_
     W_kmeans = kmeans_affinity(X, n_clusters=n_clusters, radius=radius)
     W_monocle = construct_affinity_monocle3(X, k=k, n_pcs=n_pcs, radius=radius)
     W_slingshot = construct_affinity_slingshot(X, n_clusters=n_clusters, radius=radius)
+    W_paga = construct_affinity_paga(X, n_neighbors=k)
     
     # Calculate feature rankings for each method
     features_knn = find_selected_features(W_knn, X, feature_names)
     features_kmeans = find_selected_features(W_kmeans, X, feature_names)
     features_monocle = find_selected_features(W_monocle, X, feature_names)
     features_slingshot = find_selected_features(W_slingshot, X, feature_names)
-    
-    # Create visualization
-    fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(15, 15))
-    
-    # Plot UMAP embeddings with affinity connections for each method
-    embedder = UMAP(n_components=2, random_state=0)
-    X_umap = embedder.fit_transform(X)
-    
-    methods = {
-        'kNN': (W_knn, ax1),
-        'k-means': (W_kmeans, ax2),
-        'Monocle3': (W_monocle, ax3),
-        'Slingshot': (W_slingshot, ax4)
-    }
-    
-    for method_name, (W, ax) in methods.items():
-        # Plot points
-        ax.scatter(X_umap[:, 0], X_umap[:, 1], s=1, c='lightgray', alpha=0.5)
-        
-        # Plot connections
-        rows, cols = W.nonzero()
-        for i, j in zip(rows[:1000], cols[:1000]):  # Limit connections for visibility
-            ax.plot([X_umap[i, 0], X_umap[j, 0]], 
-                   [X_umap[i, 1], X_umap[j, 1]], 
-                   'b-', linewidth=0.1, alpha=0.1)
-        
-        ax.set_title(f'{method_name} Affinity Graph')
-        ax.set_xticks([])
-        ax.set_yticks([])
-    
-    plt.tight_layout()
-    
-    # Create comparison heatmap
-    features_dict = {
-        'kNN': features_knn,
-        'k-means': features_kmeans,
-        'Monocle3': features_monocle,
-        'Slingshot': features_slingshot
-    }
-    
-    # Plot feature ranking correlations
-    plt.figure(figsize=(8, 6))
-    corr_matrix = np.zeros((4, 4))
-    methods_list = list(features_dict.keys())
-    
-    for i, method1 in enumerate(methods_list):
-        for j, method2 in enumerate(methods_list):
-            corr_matrix[i, j] = features_dict[method1]['DELVE'].corr(
-                features_dict[method2]['DELVE']
-            )
-    
-    sns.heatmap(corr_matrix, 
-                xticklabels=methods_list,
-                yticklabels=methods_list,
-                annot=True,
-                cmap='coolwarm',
-                vmin=-1,
-                vmax=1)
-    plt.title('Feature Ranking Correlation Between Methods')
-    
-    return features_dict
-
-def main():
-    adata = anndata.read_h5ad('/Users/georgeweale/delve/data/adata_RPE.h5ad')
-
-    # Extract data
-    X, X_reduced, feature_names = extract_affinity(adata=adata, k=10, 
-                                                 num_subsamples=1000, 
-                                                 n_clusters=5, 
-                                                 random_state=0, 
-                                                 n_jobs=-1)
-
-    # Calculate affinity matrices
-    W_knn = kNN_affinity(X_reduced, k=10)
-    W_kmeans = kmeans_affinity(X_reduced, n_clusters=10)
-    W_monocle = construct_affinity_monocle3(X_reduced, k=10)
-    W_slingshot = construct_affinity_slingshot(X_reduced, n_clusters=10)
-
-    # Calculate feature rankings
-    features_knn = find_selected_features(W_knn, X, feature_names)
-    features_kmeans = find_selected_features(W_kmeans, X, feature_names)
-    features_monocle = find_selected_features(W_monocle, X, feature_names)
-    features_slingshot = find_selected_features(W_slingshot, X, feature_names)
+    features_paga = find_selected_features(W_paga, X, feature_names)
 
     # Set style for better visualization
     plt.style.use('default')
     
     # Create main comparison plot with enhanced spacing
-    fig = plt.figure(figsize=(20, 12))
+    fig = plt.figure(figsize=(20, 15))
     gs = GridSpec(2, 3, figure=fig, height_ratios=[1, 1], width_ratios=[1.5, 1.5, 1])
     
     # Enhanced color palette for methods
     method_colors = {
-        'kNN': '#FF6B6B',  # Coral Red
+        'kNN': '#FF6B6B',      # Coral Red
         'k-means': '#4ECDC4',  # Turquoise
-        'Monocle3': '#45B7D1',  # Sky Blue
-        'Slingshot': '#96CEB4'  # Sage Green
+        'Monocle3': '#45B7D1', # Sky Blue
+        'Slingshot': '#96CEB4',# Sage Green
+        'PAGA': '#FFB347'     # Orange
     }
 
     # 1. UMAP visualization with affinity graphs
     ax_umap = fig.add_subplot(gs[0, :])
     embedder = UMAP(n_components=2, random_state=0)
-    X_umap = embedder.fit_transform(X_reduced)
+    X_umap = embedder.fit_transform(X)
     
     # Plot base UMAP with enhanced scatter
     scatter = ax_umap.scatter(X_umap[:, 0], X_umap[:, 1], 
@@ -881,7 +862,8 @@ def main():
         'kNN': W_knn,
         'k-means': W_kmeans,
         'Monocle3': W_monocle,
-        'Slingshot': W_slingshot
+        'Slingshot': W_slingshot,
+        'PAGA': W_paga
     }
     
     for method_name, W in methods.items():
@@ -908,16 +890,17 @@ def main():
                         fontsize=10)
     leg.get_frame().set_alpha(0.9)
 
-    # 2. Feature ranking correlation heatmap with enhanced readability
+    # 2. Feature ranking correlation heatmap
     ax_corr = fig.add_subplot(gs[1, :2])
     
-    all_features = pd.concat([
-        features_knn['DELVE'],
-        features_kmeans['DELVE'],
-        features_monocle['DELVE'],
-        features_slingshot['DELVE']
-    ], axis=1)
-    all_features.columns = ['kNN', 'k-means', 'Monocle3', 'Slingshot']
+    all_features = pd.DataFrame({
+        'kNN': features_knn['DELVE'],
+        'k-means': features_kmeans['DELVE'],
+        'Monocle3': features_monocle['DELVE'],
+        'Slingshot': features_slingshot['DELVE'],
+        'PAGA': features_paga['DELVE']
+    })
+    
     corr_matrix = all_features.corr()
     
     # Enhanced heatmap
@@ -936,28 +919,47 @@ def main():
     ax_corr.set_xticklabels(ax_corr.get_xticklabels(), rotation=45, ha='right')
     ax_corr.set_yticklabels(ax_corr.get_yticklabels(), rotation=0)
 
-    # 3. Top features comparison with enhanced table
+    # 3. Top features comparison with colored shared genes
     ax_top = fig.add_subplot(gs[1, 2])
     
     # Get top 10 features from each method
     top_features = pd.DataFrame({
-        'kNN': features_knn['DELVE'].nlargest(10).index,
-        'k-means': features_kmeans['DELVE'].nlargest(10).index,
-        'Monocle3': features_monocle['DELVE'].nlargest(10).index,
-        'Slingshot': features_slingshot['DELVE'].nlargest(10).index
+        'kNN': features_knn.nlargest(10, 'DELVE').index,
+        'k-means': features_kmeans.nlargest(10, 'DELVE').index,
+        'Monocle3': features_monocle.nlargest(10, 'DELVE').index,
+        'Slingshot': features_slingshot.nlargest(10, 'DELVE').index,
+        'PAGA': features_paga.nlargest(10, 'DELVE').index
     })
     
-    # Enhanced table
+    # Create color mapping for shared genes
+    all_genes = set()
+    for col in top_features.columns:
+        all_genes.update(top_features[col])
+    
+    # Create a colormap for shared genes
+    n_unique_genes = len(all_genes)
+    colors = plt.cm.rainbow(np.linspace(0, 1, n_unique_genes))
+    gene_to_color = dict(zip(all_genes, colors))
+    
+    # Create cell colors matrix
+    cell_colors = np.zeros((top_features.shape[0], top_features.shape[1], 4))
+    for i in range(top_features.shape[0]):
+        for j in range(top_features.shape[1]):
+            gene = top_features.iloc[i, j]
+            cell_colors[i, j] = gene_to_color[gene]
+    
+    # Enhanced table with colored cells
     ax_top.axis('tight')
     ax_top.axis('off')
     table = ax_top.table(cellText=top_features.values,
                         colLabels=top_features.columns,
                         loc='center',
-                        cellLoc='center')
+                        cellLoc='center',
+                        cellColours=cell_colors)
     
     # Enhance table appearance
     table.auto_set_font_size(False)
-    table.set_fontsize(9)
+    table.set_fontsize(8)
     table.scale(1.2, 1.8)
     
     # Style the header
@@ -967,7 +969,7 @@ def main():
             cell.set_facecolor('#E6E6E6')
         cell.set_edgecolor('#FFFFFF')
     
-    ax_top.set_title('Top 10 Features by Method', 
+    ax_top.set_title('Top 10 Features by Method\n(Same colors indicate shared genes)', 
                      fontsize=14, pad=20)
 
     # Adjust layout
@@ -976,6 +978,474 @@ def main():
     # Save high-resolution figure
     plt.savefig('affinity_comparison.png', dpi=300, bbox_inches='tight')
     plt.show()
+
+    return {
+        'features': {
+            'kNN': features_knn,
+            'k-means': features_kmeans,
+            'Monocle3': features_monocle,
+            'Slingshot': features_slingshot,
+            'PAGA': features_paga
+        },
+        'affinity_matrices': methods
+    }
+
+def compare_graph_metrics(methods):
+    """
+    Compare different affinity graphs using various graph metrics.
+    
+    Parameters:
+    methods: dict
+        Dictionary containing the affinity matrices from different methods
+    """
+    # Initialize metrics dictionary
+    metrics = {
+        'Density': [],
+        'Average Degree': [],
+        'Average Clustering': [],
+        'Number of Components': [],
+        'Average Path Length': []
+    }
+    
+    method_names = []
+    
+    # Calculate metrics for each method
+    for method_name, W in methods.items():
+        print(f"Analyzing {method_name}...")
+        
+        # Convert sparse matrix to networkx graph
+        G = nx.from_scipy_sparse_array(W)
+        
+        # Calculate metrics
+        metrics['Density'].append(nx.density(G))
+        metrics['Average Degree'].append(np.mean([d for n, d in G.degree()]))
+        metrics['Average Clustering'].append(nx.average_clustering(G))
+        metrics['Number of Components'].append(nx.number_connected_components(G))
+        
+        # Calculate average path length (only for the largest component to avoid inf values)
+        largest_cc = max(nx.connected_components(G), key=len)
+        subgraph = G.subgraph(largest_cc)
+        metrics['Average Path Length'].append(nx.average_shortest_path_length(subgraph))
+        
+        method_names.append(method_name)
+    
+    # Create visualization
+    fig = plt.figure(figsize=(15, 10))
+    gs = GridSpec(2, 2, figure=fig)
+    
+    # 1. Radar plot of normalized metrics
+    ax_radar = fig.add_subplot(gs[0, 0], projection='polar')
+    
+    # Normalize metrics for radar plot
+    metrics_norm = {}
+    for metric in metrics:
+        values = metrics[metric]
+        min_val = min(values)
+        max_val = max(values)
+        if max_val - min_val > 0:
+            metrics_norm[metric] = [(v - min_val) / (max_val - min_val) for v in values]
+        else:
+            metrics_norm[metric] = [1 for v in values]
+    
+    # Number of metrics
+    num_metrics = len(metrics)
+    angles = [n / float(num_metrics) * 2 * np.pi for n in range(num_metrics)]
+    angles += angles[:1]
+    
+    # Plot for each method
+    colors = plt.cm.rainbow(np.linspace(0, 1, len(method_names)))
+    for i, method in enumerate(method_names):
+        values = [metrics_norm[metric][i] for metric in metrics_norm.keys()]
+        values += values[:1]
+        ax_radar.plot(angles, values, color=colors[i], linewidth=2, label=method)
+        ax_radar.fill(angles, values, color=colors[i], alpha=0.25)
+    
+    # Set radar chart labels
+    ax_radar.set_xticks(angles[:-1])
+    ax_radar.set_xticklabels(list(metrics.keys()))
+    ax_radar.set_title('Normalized Graph Metrics Comparison')
+    ax_radar.legend(loc='center left', bbox_to_anchor=(1.2, 0.5))
+    
+    # 2. Bar plot of raw metrics
+    ax_bar = fig.add_subplot(gs[0, 1])
+    x = np.arange(len(method_names))
+    width = 0.15
+    multiplier = 0
+    
+    for metric, values in metrics.items():
+        offset = width * multiplier
+        rects = ax_bar.bar(x + offset, values, width, label=metric)
+        multiplier += 1
+    
+    ax_bar.set_ylabel('Value')
+    ax_bar.set_title('Raw Graph Metrics')
+    ax_bar.set_xticks(x + width * 2)
+    ax_bar.set_xticklabels(method_names, rotation=45)
+    ax_bar.legend(loc='upper left', bbox_to_anchor=(1, 1))
+    
+    # 3. Degree distribution comparison
+    ax_degree = fig.add_subplot(gs[1, 0])
+    for i, method in enumerate(method_names):
+        G = nx.from_scipy_sparse_array(methods[method])
+        degrees = [d for n, d in G.degree()]
+        ax_degree.hist(degrees, bins=50, alpha=0.5, label=method, color=colors[i])
+    
+    ax_degree.set_xlabel('Degree')
+    ax_degree.set_ylabel('Frequency')
+    ax_degree.set_title('Degree Distribution')
+    ax_degree.legend()
+    ax_degree.set_yscale('log')
+    
+    # 4. Clustering coefficient distribution
+    ax_cluster = fig.add_subplot(gs[1, 1])
+    for i, method in enumerate(method_names):
+        G = nx.from_scipy_sparse_array(methods[method])
+        clustering_coeffs = list(nx.clustering(G).values())
+        ax_cluster.hist(clustering_coeffs, bins=50, alpha=0.5, label=method, color=colors[i])
+    
+    ax_cluster.set_xlabel('Clustering Coefficient')
+    ax_cluster.set_ylabel('Frequency')
+    ax_cluster.set_title('Clustering Coefficient Distribution')
+    ax_cluster.legend()
+    ax_cluster.set_yscale('log')
+    
+    plt.tight_layout()
+    plt.savefig('graph_metrics_comparison.png', dpi=300, bbox_inches='tight')
+    plt.show()
+    
+    # Print summary statistics
+    print("\nSummary Statistics:")
+    for metric in metrics:
+        print(f"\n{metric}:")
+        for method, value in zip(method_names, metrics[metric]):
+            print(f"{method}: {value:.4f}")
+
+def compare_methods_simple(methods, features_dict, X_umap):
+    """
+    Create simple visualizations comparing the different methods.
+    
+    Parameters:
+    methods: dict
+        Dictionary of affinity matrices from different methods
+    features_dict: dict
+        Dictionary of feature rankings from different methods
+    X_umap: array
+        UMAP coordinates of the data
+    """
+    fig = plt.figure(figsize=(20, 10))
+    
+    # 1. Edge Density Comparison (Simple Bar Plot)
+    plt.subplot(231)
+    densities = []
+    for method, W in methods.items():
+        density = W.nnz / (W.shape[0] * W.shape[1])
+        densities.append(density)
+    
+    plt.bar(methods.keys(), densities)
+    plt.title('Edge Density by Method')
+    plt.xticks(rotation=45)
+    plt.ylabel('Density')
+    
+    # 2. Feature Overlap Analysis (Top 50 features)
+    plt.subplot(232)
+    top_n = 50
+    feature_sets = {method: set(features['DELVE'].nlargest(top_n).index) 
+                   for method, features in features_dict.items()}
+    
+    overlap_matrix = np.zeros((len(methods), len(methods)))
+    for i, (method1, set1) in enumerate(feature_sets.items()):
+        for j, (method2, set2) in enumerate(feature_sets.items()):
+            overlap = len(set1.intersection(set2)) / top_n
+            overlap_matrix[i, j] = overlap
+    
+    sns.heatmap(overlap_matrix, 
+                xticklabels=methods.keys(), 
+                yticklabels=methods.keys(),
+                annot=True, 
+                fmt='.2f', 
+                cmap='YlOrRd')
+    plt.title(f'Feature Overlap (Top {top_n})')
+    plt.xticks(rotation=45)
+    plt.yticks(rotation=0)
+    
+    # 3. Connectivity Pattern Visualization
+    plt.subplot(233)
+    connectivity_patterns = []
+    for W in methods.values():
+        # Calculate average connectivity at different distances in UMAP space
+        distances = euclidean_distances(X_umap)
+        connected = W.toarray() > 0
+        avg_connectivity = []
+        distance_bins = np.linspace(0, np.percentile(distances, 90), 20)
+        
+        for i in range(len(distance_bins)-1):
+            mask = (distances > distance_bins[i]) & (distances <= distance_bins[i+1])
+            avg_connectivity.append(np.mean(connected[mask]))
+        
+        connectivity_patterns.append(avg_connectivity)
+    
+    for method, pattern in zip(methods.keys(), connectivity_patterns):
+        plt.plot(distance_bins[1:], pattern, label=method, marker='o')
+    plt.title('Connectivity vs Distance')
+    plt.xlabel('UMAP Distance')
+    plt.ylabel('Connection Probability')
+    plt.legend()
+    
+    # 4. Node Degree Distribution (Box Plot)
+    plt.subplot(234)
+    degrees_data = []
+    method_labels = []
+    for method, W in methods.items():
+        degrees = np.array(W.sum(axis=1)).flatten()
+        degrees_data.extend(degrees)
+        method_labels.extend([method] * len(degrees))
+    
+    sns.boxplot(x=method_labels, y=degrees_data)
+    plt.title('Node Degree Distribution')
+    plt.xticks(rotation=45)
+    plt.ylabel('Degree')
+    
+    # 5. Feature Score Distribution
+    plt.subplot(235)
+    for method, features in features_dict.items():
+        sns.kdeplot(features['DELVE'], label=method)
+    plt.title('Feature Score Distribution')
+    plt.xlabel('DELVE Score')
+    plt.ylabel('Density')
+    plt.legend()
+    
+    # 6. Sparsity Pattern
+    plt.subplot(236)
+    sparsity_data = []
+    for method, W in methods.items():
+        non_zero_rows = np.diff(W.indptr)
+        sparsity_data.append(non_zero_rows)
+    
+    plt.boxplot(sparsity_data, labels=methods.keys())
+    plt.title('Connections per Cell')
+    plt.xticks(rotation=45)
+    plt.ylabel('Number of Connections')
+    
+    plt.tight_layout()
+    plt.savefig('method_comparison_simple.png', dpi=300, bbox_inches='tight')
+    plt.show()
+    
+    # Print some summary statistics
+    print("\nSummary Statistics:")
+    print("\nAverage number of connections per cell:")
+    for method, W in methods.items():
+        avg_connections = W.nnz / W.shape[0]
+        print(f"{method}: {avg_connections:.2f}")
+    
+    print("\nFeature overlap between methods:")
+    for method1, set1 in feature_sets.items():
+        for method2, set2 in feature_sets.items():
+            if method1 < method2:
+                overlap = len(set1.intersection(set2))
+                print(f"{method1} vs {method2}: {overlap} features in common")
+
+def main():
+    adata = anndata.read_h5ad('/Users/georgeweale/delve/data/adata_RPE.h5ad')
+
+    # Extract data
+    X, X_reduced, feature_names = extract_affinity(adata=adata, k=10, 
+                                                 num_subsamples=1000, 
+                                                 n_clusters=5, 
+                                                 random_state=0, 
+                                                 n_jobs=-1)
+
+    # Calculate affinity matrices using GAT
+    W_gat = construct_affinity_gat(X_reduced, k=10)
+    
+    # Calculate other affinity matrices
+    W_knn = kNN_affinity(X_reduced, k=10)
+    W_kmeans = kmeans_affinity(X_reduced, n_clusters=10)
+    W_monocle = construct_affinity_monocle3(X_reduced, k=10)
+    W_slingshot = construct_affinity_slingshot(X_reduced, n_clusters=10)
+    W_paga = construct_affinity_paga(X_reduced, n_neighbors=10)
+
+    # Update methods dictionary
+    methods = {
+        'GAT': W_gat,
+        'kNN': W_knn,
+        'k-means': W_kmeans,
+        'Monocle3': W_monocle,
+        'Slingshot': W_slingshot,
+        'PAGA': W_paga
+    }
+
+    # Calculate feature rankings
+    features_knn = find_selected_features(W_knn, X, feature_names)
+    features_kmeans = find_selected_features(W_kmeans, X, feature_names)
+    features_monocle = find_selected_features(W_monocle, X, feature_names)
+    features_slingshot = find_selected_features(W_slingshot, X, feature_names)
+    features_paga = find_selected_features(W_paga, X, feature_names)
+
+    # Set style for better visualization
+    plt.style.use('default')
+    
+    # Create main comparison plot with enhanced spacing
+    fig = plt.figure(figsize=(20, 15))
+    gs = GridSpec(2, 3, figure=fig, height_ratios=[1, 1], width_ratios=[1.5, 1.5, 1])
+    
+    # Enhanced color palette for methods
+    method_colors = {
+        'kNN': '#FF6B6B',      # Coral Red
+        'k-means': '#4ECDC4',  # Turquoise
+        'Monocle3': '#45B7D1', # Sky Blue
+        'Slingshot': '#96CEB4',# Sage Green
+        'PAGA': '#FFB347'     # Orange
+    }
+
+    # 1. UMAP visualization with affinity graphs
+    ax_umap = fig.add_subplot(gs[0, :])
+    embedder = UMAP(n_components=2, random_state=0)
+    X_umap = embedder.fit_transform(X_reduced)
+    
+    # Plot base UMAP with enhanced scatter
+    scatter = ax_umap.scatter(X_umap[:, 0], X_umap[:, 1], 
+                            c=np.arange(X_umap.shape[0]), 
+                            cmap='viridis', 
+                            s=2, alpha=0.7)
+    ax_umap.set_title('UMAP Visualization with Different Affinity Graphs', 
+                     fontsize=14, pad=20)
+    
+    # Add affinity connections with enhanced visibility
+    methods = {
+        'GAT': W_gat,
+        'kNN': W_knn,
+        'k-means': W_kmeans,
+        'Monocle3': W_monocle,
+        'Slingshot': W_slingshot,
+        'PAGA': W_paga
+    }
+    
+    for method_name, W in methods.items():
+        rows, cols = W.nonzero()
+        # Intelligent subsampling based on matrix density
+        n_samples = min(300, len(rows))
+        mask = np.random.choice(len(rows), size=n_samples, replace=False)
+        
+        for i, j in zip(rows[mask], cols[mask]):
+            ax_umap.plot([X_umap[i, 0], X_umap[j, 0]], 
+                        [X_umap[i, 1], X_umap[j, 1]], 
+                        c=method_colors[method_name], 
+                        linewidth=0.3, 
+                        alpha=0.4, 
+                        label=method_name)
+    
+    # Enhanced legend
+    handles = [plt.Line2D([0], [0], color=color, label=method, linewidth=2) 
+              for method, color in method_colors.items()]
+    leg = ax_umap.legend(handles=handles, 
+                        loc='center left', 
+                        bbox_to_anchor=(1.02, 0.5),
+                        frameon=True,
+                        fontsize=10)
+    leg.get_frame().set_alpha(0.9)
+
+    # 2. Feature ranking correlation heatmap
+    ax_corr = fig.add_subplot(gs[1, :2])
+    
+    all_features = pd.DataFrame({
+        'kNN': features_knn['DELVE'],
+        'k-means': features_kmeans['DELVE'],
+        'Monocle3': features_monocle['DELVE'],
+        'Slingshot': features_slingshot['DELVE'],
+        'PAGA': features_paga['DELVE']
+    })
+    
+    corr_matrix = all_features.corr()
+    
+    # Enhanced heatmap
+    sns.heatmap(corr_matrix, 
+                annot=True, 
+                cmap='RdYlBu_r', 
+                vmin=-1, 
+                vmax=1, 
+                ax=ax_corr,
+                annot_kws={'size': 10},
+                square=True,
+                fmt='.2f')
+    
+    ax_corr.set_title('Feature Ranking Correlation Between Methods', 
+                      fontsize=14, pad=20)
+    ax_corr.set_xticklabels(ax_corr.get_xticklabels(), rotation=45, ha='right')
+    ax_corr.set_yticklabels(ax_corr.get_yticklabels(), rotation=0)
+
+    # 3. Top features comparison with colored shared genes
+    ax_top = fig.add_subplot(gs[1, 2])
+    
+    # Get top 10 features from each method
+    top_features = pd.DataFrame({
+        'kNN': features_knn.nlargest(10, 'DELVE').index,
+        'k-means': features_kmeans.nlargest(10, 'DELVE').index,
+        'Monocle3': features_monocle.nlargest(10, 'DELVE').index,
+        'Slingshot': features_slingshot.nlargest(10, 'DELVE').index,
+        'PAGA': features_paga.nlargest(10, 'DELVE').index
+    })
+    
+    # Create color mapping for shared genes
+    all_genes = set()
+    for col in top_features.columns:
+        all_genes.update(top_features[col])
+    
+    # Create a colormap for shared genes
+    n_unique_genes = len(all_genes)
+    colors = plt.cm.rainbow(np.linspace(0, 1, n_unique_genes))
+    gene_to_color = dict(zip(all_genes, colors))
+    
+    # Create cell colors matrix
+    cell_colors = np.zeros((top_features.shape[0], top_features.shape[1], 4))
+    for i in range(top_features.shape[0]):
+        for j in range(top_features.shape[1]):
+            gene = top_features.iloc[i, j]
+            cell_colors[i, j] = gene_to_color[gene]
+    
+    # Enhanced table with colored cells
+    ax_top.axis('tight')
+    ax_top.axis('off')
+    table = ax_top.table(cellText=top_features.values,
+                        colLabels=top_features.columns,
+                        loc='center',
+                        cellLoc='center',
+                        cellColours=cell_colors)
+    
+    # Enhance table appearance
+    table.auto_set_font_size(False)
+    table.set_fontsize(8)
+    table.scale(1.2, 1.8)
+    
+    # Style the header
+    for (row, col), cell in table.get_celld().items():
+        if row == 0:
+            cell.set_text_props(weight='bold')
+            cell.set_facecolor('#E6E6E6')
+        cell.set_edgecolor('#FFFFFF')
+    
+    ax_top.set_title('Top 10 Features by Method\n(Same colors indicate shared genes)', 
+                     fontsize=14, pad=20)
+
+    # Adjust layout
+    plt.tight_layout()
+    
+    # Save high-resolution figure
+    plt.savefig('affinity_comparison.png', dpi=300, bbox_inches='tight')
+    plt.show()
+
+    # Create the new comparison visualization
+    compare_graph_metrics(methods)
+
+    # In your main function, after creating all matrices and feature rankings:
+    features_dict = {
+        'kNN': features_knn,
+        'k-means': features_kmeans,
+        'Monocle3': features_monocle,
+        'Slingshot': features_slingshot,
+        'PAGA': features_paga
+    }
+
+    compare_methods_simple(methods, features_dict, X_umap)
 
 if __name__ == '__main__':
     mp.freeze_support()
