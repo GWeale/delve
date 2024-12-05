@@ -6,6 +6,7 @@ import anndata
 import scipy
 import numpy as np
 import pandas as pd
+import scanpy as sc
 import logging
 from sklearn.cluster import KMeans
 from sklearn.neighbors import NearestNeighbors
@@ -14,6 +15,8 @@ import multiprocessing as mp
 from functools import partial
 from tqdm import tqdm
 from sketchKH import *
+import matplotlib.pyplot as plt
+from scipy.stats import spearmanr
 
 
 
@@ -279,7 +282,7 @@ def laplacian_score(X = None,
     #compute graph laplacian
     L = D - W.toarray()
 
-    #ones vector: 1 = [1,···,1]'
+    #ones vector: 1 = [1,··,1]'
     ones = np.ones((n_samples,n_features))
 
     #feature vector: fr = [fr1,...,frm]'
@@ -498,23 +501,109 @@ def _annotate_clusters(mapping_df = None,
     modules['cluster_permutation_pval'] = pval_df.median(1) #median across all random trials
     return modules
 
+def compare_feature_trajectories(adata, features_set1, features_set2, k=10, n_pcs=None, n_jobs=-1):
+    """Compares trajectories between two feature sets using weighted feature importance"""
+    
+    # Create two separate AnnData objects for each feature set
+    adata1 = adata[:, features_set1].copy()
+    adata2 = adata[:, features_set2].copy()
+    
+    # Get feature weights based on their ranking
+    weights1 = {feat: 1/(i+1) for i, feat in enumerate(features_set1)}
+    weights2 = {feat: 1/(i+1) for i, feat in enumerate(features_set2)}
+    
+    # Apply weights to the expression data
+    for feat in features_set1:
+        adata1[:, feat].X *= weights1[feat]
+    for feat in features_set2:
+        adata2[:, feat].X *= weights2[feat]
+    
+    # Normalize after weighting
+    sc.pp.scale(adata1)
+    sc.pp.scale(adata2)
+    
+    # Process Set 1 with weighted features
+    sc.pp.neighbors(adata1, n_neighbors=k, use_rep='X', metric='cosine')
+    sc.tl.umap(adata1, min_dist=0.5)
+    sc.tl.diffmap(adata1, n_comps=10)
+    
+    # Find root cell for set 1 using feature-weighted approach
+    feature_scores1 = np.average(adata1.X, axis=1, 
+                               weights=[weights1[feat] for feat in features_set1])
+    adata1.uns['iroot'] = np.argmin(feature_scores1)
+    sc.tl.dpt(adata1)
+    traj1 = adata1.obs['dpt_pseudotime'].values
+    umap1 = adata1.obsm['X_umap']
+    
+    # Process Set 2 with weighted features
+    sc.pp.neighbors(adata2, n_neighbors=k, use_rep='X', metric='cosine')
+    sc.tl.umap(adata2, min_dist=0.5)
+    sc.tl.diffmap(adata2, n_comps=10)
+    
+    # Find root cell for set 2 using feature-weighted approach
+    feature_scores2 = np.average(adata2.X, axis=1, 
+                               weights=[weights2[feat] for feat in features_set2])
+    adata2.uns['iroot'] = np.argmin(feature_scores2)
+    sc.tl.dpt(adata2)
+    traj2 = adata2.obs['dpt_pseudotime'].values
+    umap2 = adata2.obsm['X_umap']
+    
+    # Calculate correlation
+    correlation, pvalue = spearmanr(traj1, traj2)
+    
+    # Visualize trajectories
+    fig = plt.figure(figsize=(15, 5))
+    
+    # Plot 1: UMAP with trajectory 1
+    ax1 = fig.add_subplot(131)
+    scatter1 = ax1.scatter(umap1[:, 0], umap1[:, 1], 
+                          c=traj1, cmap='viridis', s=10)
+    plt.colorbar(scatter1, ax=ax1, label='Pseudotime')
+    ax1.set_title(f'Non-attention Trajectory\nTop feature: {features_set1[0]}')
+    
+    # Plot 2: UMAP with trajectory 2
+    ax2 = fig.add_subplot(132)
+    scatter2 = ax2.scatter(umap2[:, 0], umap2[:, 1], 
+                          c=traj2, cmap='viridis', s=10)
+    plt.colorbar(scatter2, ax=ax2, label='Pseudotime')
+    ax2.set_title(f'Attention Trajectory\nTop feature: {features_set2[0]}')
+    
+    # Plot 3: Trajectory correlation
+    ax3 = fig.add_subplot(133)
+    ax3.scatter(traj1, traj2, alpha=0.5, s=10)
+    ax3.set_xlabel('Non-attention pseudotime')
+    ax3.set_ylabel('Attention pseudotime')
+    ax3.set_title(f'Trajectory Correlation\nr = {correlation:.3f}')
+    
+    plt.tight_layout()
+    plt.show()
+    
+    return correlation, traj1, traj2
 
 def main():
-    adata = anndata.read_h5ad('/Users/georgeweale/delve/data/adata_RPE.h5ad')
-
-    delta_mean, modules, ranked_features = delve_fs(adata = adata, k = 10, num_subsamples = 1000, n_clusters = 5, random_state = 0, n_jobs = -1)
-
-    print(ranked_features)
-
-
-
-
-
-
-
-
+    # Load your data
+    adata = sc.read_h5ad('/Users/georgeweale/delve/data/adata_RPE.h5ad')
+    
+    # Read feature sets from CSV
+    features_df = pd.read_csv('cyril/combined_features.csv')
+    
+    # Get top N features from each set
+    N = 50  # Adjust this number as needed
+    features_knn = features_df['features_knn'].dropna().tolist()[:N]
+    features_knn_weighted = features_df['features_knn_weighted'].dropna().tolist()[:N]
+    
+    # Compare trajectories
+    correlation, traj1, traj2 = compare_feature_trajectories(
+        adata=adata,
+        features_set1=features_knn,
+        features_set2=features_knn_weighted,
+        k=15
+    )
+    
+    print(f"\nTrajectory Analysis Results:")
+    print(f"Correlation between trajectories: {correlation:.3f}")
+    print(f"Top non-attention feature: {features_knn[0]}")
+    print(f"Top attention feature: {features_knn_weighted[0]}")
 
 if __name__ == '__main__':
-    mp.set_start_method('spawn')
-    mp.freeze_support()
     main()
