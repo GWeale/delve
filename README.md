@@ -76,5 +76,10 @@ from delve import *
 delta_mean, modules, ranked_features = delve_fs(adata = adata, k = 10, num_subsamples = 1000, n_clusters = 5, random_state = 0, n_jobs = -1)
 ```
 
+```
+The run_delve file contains the main function for performing DELVE feature selection and has our changes without attention. 
+The changes folder has all the different files we changed and added attetnion to, the names show what is done in each of them! :D
+```
+
 ## License
 This software is licensed under the MIT license (https://opensource.org/licenses/MIT).
