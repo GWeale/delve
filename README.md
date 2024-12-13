@@ -75,7 +75,36 @@ Then simply perform DELVE feature selection by,
 from delve import *
 delta_mean, modules, ranked_features = delve_fs(adata = adata, k = 10, num_subsamples = 1000, n_clusters = 5, random_state = 0, n_jobs = -1)
 ```
+## Recent Updates and Changes
 
+The project has been extended with several new features and analyses:
+
+### Attention Mechanism Implementation
+- Added an attention-based autoencoder to improve feature selection
+- The attention mechanism learns feature importance weights through unsupervised learning
+- Implemented in `delve_ae.py` and `delve_ae_new_it.py`
+
+### Multiple Affinity Graph Methods
+Added various methods to construct affinity graphs (`basic_affinity.py`):
+- kNN-based affinity
+- K-means clustering-based affinity
+- RBF kernel-based affinity
+- GMM-based affinity
+
+### Trajectory Analysis
+New tools for analyzing and comparing trajectories (`trajectory_comparison.py`):
+- Comparison of trajectories between different feature selection methods
+- Visualization of trajectory preservation
+- Quantitative metrics for trajectory similarity
+
+### Preservation Testing
+Added comprehensive testing framework (`test_preservation.py`):
+- Cell state preservation analysis
+- Trajectory preservation testing
+- Visualization tools for comparing different feature selection approaches
+- Quantitative metrics including ARI scores and silhouette coefficients
+
+These updates provide more robust ways to analyze and validate feature selection methods, with particular focus on comparing traditional approaches with attention-based methods.
 ```
 The run_delve file contains the main function for performing DELVE feature selection and has our changes without attention. 
 The changes folder has all the different files we changed and added attetnion to, the names show what is done in each of them! :D
